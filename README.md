@@ -1,18 +1,18 @@
 # QUALS: Corpus Equilibrium for Universal Forecasting via Pattern Quantization and Learnability Synchronization
 
+🎉 **Accepted to PVLDB (VLDB 2027), Volume 20, Issue 2, pages 108–121.**
+
+[📄 Paper (arXiv)](https://arxiv.org/abs/2609.20156) · [🔗 DOI](https://doi.org/10.14778/3849423.3849427) · [💻 Code](https://github.com/GestaltCogTeam/QUALS) · [🤗 Corpus (Hugging Face)](https://huggingface.co/datasets/Blisky-li/QUALS)
+
 This repository contains the reference implementation of **QUALS**, a scalable corpus construction pipeline for universal time-series forecasting.
 QUALS improves pre-training data efficiency by reorganizing large heterogeneous time-series corpora into a **pattern-balanced** and **learnability-synchronized** training corpus.
 
 The core idea is simple: not all time series patterns are equally represented, and not all patterns are equally easy to learn.
 QUALS first discovers reusable temporal motifs through vector quantization, then builds uniform semantic bins over the corpus, and finally learns bin-level sampling weights that synchronize convergence across easy and difficult patterns.
 
-> Paper: `QUALS: Corpus Equilibrium for Universal Forecasting via Pattern Quantization and Learnability Synchronization`
+The QUALS corpus is hosted on [Hugging Face](https://huggingface.co/datasets/Blisky-li/QUALS). Please refer to the dataset page for the available files and download instructions.
 
-> Source code: `https://github.com/blisky-li/QUALS`
-
-> Corpus link: `https://huggingface.co/datasets/Blisky-li/QUALS` (The data of 300G+ is currently being slowly uploaded to HuggingFace)
-
-## Overview
+## 🧭 Overview
 
 QUALS is organized as a three-stage pipeline:
 
@@ -26,8 +26,39 @@ QUALS is organized as a three-stage pipeline:
    Estimate bin-wise convergence speeds from proxy training logs and optimize bin sampling weights with offline GRPO, producing a learnability-balanced sampling distribution.
 
 The resulting corpus can be used to pre-train universal forecasting models with a substantially reduced token budget while preserving diverse and difficult temporal patterns.
+Experiments across multiple model families and benchmarks demonstrate improved zero-shot forecasting accuracy and cross-domain generalization under reduced pre-training budgets. These gains extend to long-term forecasting and challenging temporal patterns, showing that balancing corpus composition improves both data efficiency and forecasting quality.
 
-## Repository Structure
+## 🏆 Benchmarks
+
+The paper evaluates QUALS across complementary forecasting benchmarks:
+
+| Benchmark | Paper |
+| --- | --- |
+| [BasicTS](https://github.com/GestaltCogTeam/BasicTS) | [Exploring Progress in Multivariate Time Series Forecasting: Comprehensive Benchmarking and Heterogeneity Analysis](https://arxiv.org/abs/2310.06119) |
+| [ARIES-TEST](https://github.com/blisky-li/ARIES) | [ARIES: Relation Assessment and Model Recommendation for Deep Time Series Forecasting](https://arxiv.org/abs/2509.06060) |
+| [GIFT-Eval](https://github.com/SalesforceAIResearch/gift-eval) | [GIFT-Eval: A Benchmark For General Time Series Forecasting Model Evaluation](https://arxiv.org/abs/2410.10393) |
+| [TSFM-Bench](https://github.com/decisionintelligence/TSFM-Bench) | [TSFM-Bench: A Comprehensive and Unified Benchmark of Foundation Models for Time Series Forecasting](https://arxiv.org/abs/2410.11802) |
+| [FEV-Bench](https://github.com/autogluon/fev) | [fev-bench: A Realistic Benchmark for Time Series Forecasting](https://arxiv.org/abs/2509.26468) |
+
+### 📊 Cross-benchmark Results
+
+The figures below are cropped directly from **Tables 5 and 4** of the [QUALS paper](https://arxiv.org/abs/2609.20156), preserving the original results and highlighting. **Q** denotes models retrained on QUALS, **B** denotes models retrained on BLAST, and models without a superscript are the official pretrained checkpoints; **s / b / l** indicate small / base / large.
+
+[BLAST: Balanced Sampling Time Series Corpus for Universal Forecasting Models](https://arxiv.org/abs/2505.17871) characterizes temporal patterns with statistical features and balances their coverage through grid-based sampling and mixup. QUALS learns multi-scale pattern representations with VQ-SwinTTS and additionally uses offline GRPO to synchronize learning progress across pattern bins.
+
+**Cross-benchmark zero-shot forecasting (Table 5).** Results cover ARIES-TEST, GIFT-Eval, TSFM-Bench, and FEV-Bench. ↓ means lower is better; ↑ means higher is better. TSFM-Bench and FEV-Bench report skill scores relative to Seasonal Naive. GIFT-Eval-B is the BLAST-configured, leakage-free test subset, while GIFT-Eval-F is the full benchmark. The paper discusses test-data overlap in some official and BLAST pretraining corpora; QUALS excludes these overlaps.
+
+![Cross-benchmark zero-shot forecasting results from Table 5](assets/cross-benchmark-results.png)
+
+[View full-resolution Table 5](assets/cross-benchmark-results.png)
+
+**Long-term forecasting (Table 4).** Results on ETTh1, ETTh2, ETTm1, ETTm2, and Weather, evaluated using [BasicTS](https://github.com/GestaltCogTeam/BasicTS).
+
+![Long-term forecasting results from Table 4](assets/long-term-forecasting-results.png)
+
+[View full-resolution Table 4](assets/long-term-forecasting-results.png)
+
+## 📂 Repository Structure
 
 ```text
 quals/
@@ -45,7 +76,7 @@ quals/
     └── README.md                   # Stage 3 details
 ```
 
-## Installation
+## ⚙️ Installation
 
 Create the conda environment from the provided environment file:
 
@@ -57,7 +88,7 @@ conda activate quals
 The reference environment was tested with Python 3.9 and PyTorch 2.7.1 + CUDA 12.8.
 If your CUDA driver is different, install the matching PyTorch build first, then install the remaining packages listed in `environment.txt`.
 
-## Data Preparation
+## 📦 Data Preparation
 
 QUALS expects time-series datasets to be stored as `.npy` arrays with companion metadata `.json` files containing valid-index information.
 For open-source release, all local paths are represented by placeholders:
@@ -75,7 +106,7 @@ For open-source release, all local paths are represented by placeholders:
 
 Replace these placeholders with your own paths before running the scripts.
 
-## Stage 1: Train VQ-SwinTTS
+## 🧩 Stage 1: Train VQ-SwinTTS
 
 Stage 1 learns patch-level temporal patterns through a Swin-style hierarchical encoder and vector quantization.
 The trained model provides a shared codebook used by later corpus binning steps.
@@ -103,65 +134,29 @@ Important outputs:
 <SWIN_CHECKPOINT_PATH>      # VQ-SwinTTS checkpoint
 ```
 
-## Stage 2: Build Uniform Pattern Bins
+## 🗂️ Stage 2: Build Uniform Pattern Bins
 
-Stage 2 converts the raw corpus into discrete pattern bins.
-It first extracts VQ-SwinTTS codebook IDs, then builds series-level embeddings, assigns them to spectral bins, and finally samples sequences from the bin-balanced corpus.
+Stage 2 organizes the raw corpus into a pattern-balanced candidate corpus. The frozen VQ-SwinTTS model first extracts multi-scale codebook representations, which are aggregated into series-level embeddings. These embeddings provide a shared pattern space for grouping sequences from different source datasets.
 
-Detailed tutorial:
+[Algorithm1.py](stage2UniformPatternBinning/Algorithm1.py) constructs the spectral partition from the learned codebook. The preprocessing pipeline assigns series embeddings to pattern bins, builds indices for efficient access, and samples sequences across bins to form the candidate corpus used by Stage 3.
 
-```text
-stage2UniformPatternBinning/Preprocess/TUTORIAL.md
-```
-
-Recommended order:
+Before running, configure the raw-data, checkpoint, and output paths in the scripts. The feature-extraction and partition-construction entry points are:
 
 ```bash
-cd <PROJECT_ROOT>/quals/stage2UniformPatternBinning/Preprocess
+cd <PROJECT_ROOT>/quals/stage2UniformPatternBinning
 
-# 1. Extract VQ-SwinTTS codebook features from raw series.
-python 01_extract_patch_features.py
+# Extract patch-level codebook representations.
+python Preprocess/01_extract_patch_features.py
 
-# 2. Check whether every source file has a codebook output.
-python 01_1_check_missing_codebook_files.py
-
-# 3. Register all codebook files with stable file IDs.
-python 02_build_codebook_file_index.py
-
-# 4. Validate codebook tensor lengths.
-python 02_1_validate_codebook_length.py
-
-# 5. Convert codebook IDs to multi-scale embeddings.
-python 03_build_scale_embeddings.py
-
-# 6. Assign embeddings to pattern cells.
-python 04_assign_cells_from_embeddings.py
-
-# 7. Build cell-wise HDF5 indices.
-python 05_build_cell_usage_hdf5.py
-
-# 8. Inspect or visualize the cell distribution.
-python 05_1_inspect_cell_usage_hdf5.py
-python 05_2_export_global_cell_distribution.py
-
-# 9. Sample sequences from each cell and build the final corpus.
-python 06_sample_sequences_per_cell.py
-python 07_build_final_resampled_dataset.py
+# Construct and save the codebook partition.
+python Algorithm1.py
 ```
 
-Important outputs:
+The remaining preprocessing steps produce bin assignments (`*_cellindex.npz`), a cell-wise index, and the sampled corpus (`sequences_by_indexre.dat`). Together, the corpus and bin indices support bin-level sampling and learnability profiling in Stage 3.
 
-```text
-*_codebook.npz                  # codebook IDs extracted by VQ-SwinTTS
-*_embedding.npz                 # series-level multi-scale embeddings
-*_cellindex.npz                 # pattern-bin assignments
-registered_codebook_index.json  # stable file-id mapping
-cell_usage_uint32_2500.h5       # cell-wise index table
-sequences_by_indexre.dat        # final sampled corpus
-sequences_by_indexre_shape.npy  # memmap shape
-```
+See the [preprocessing tutorial](stage2UniformPatternBinning/Preprocess/TUTORIAL.md) for the complete execution order, intermediate checks, and output formats.
 
-## Stage 3: Learn GRPO Sampling Weights
+## 🎯 Stage 3: Learn GRPO Sampling Weights
 
 Stage 3 uses offline learnability profiles to learn bin sampling weights.
 Given validation curves from a uniformly sampled proxy training run, it computes bin-wise convergence speeds and optimizes a policy network with GRPO.
@@ -194,7 +189,7 @@ stage3_grpo_model.pt              # learned MLP policy and embeddings
 stage3_grpo_report.json           # similarity metrics against baseline weights
 ```
 
-## Using the QUALS Corpus
+## 🚀 Using the QUALS Corpus
 
 After Stage 2 and Stage 3, use the sampled corpus and learned bin weights to construct a pre-training sampler for your forecasting model.
 A typical sampler should:
@@ -205,6 +200,22 @@ A typical sampler should:
 4. Sample bins according to the learned weights.
 5. Sample sequences within each selected bin for model pre-training.
 
-## Citation
+## 📖 Citation
 
-Comming Soon
+If you use QUALS in your research, please cite our paper:
+
+```bibtex
+@article{li2026quals,
+  title   = {{QUALS}: Corpus Equilibrium for Universal Forecasting via Pattern Quantization and Learnability Synchronization},
+  author  = {Yujie Li and Zezhi Shao and Chengqing Yu and Yisong Fu and Weijie Zhu and Yifan Du and Jilin Hu and Bin Yang and Yongjun Xu and Fei Wang},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {20},
+  number  = {2},
+  pages   = {108--121},
+  year    = {2026},
+  doi     = {10.14778/3849423.3849427},
+  url     = {https://doi.org/10.14778/3849423.3849427},
+  note    = {Accepted to PVLDB (VLDB 2027)}
+}
+```
+
