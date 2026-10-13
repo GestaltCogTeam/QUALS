@@ -4,29 +4,20 @@ import torch.nn.functional as F
 from typing import Callable, Optional, Union, List
 import math
 import collections.abc
+import numpy as np
 
 
 def meshgrid(*tensors: Union[torch.Tensor, List[torch.Tensor]], indexing: str = "ij"):
     """
-    Input:
-        - *tensors: shape [D1, ..., Dn] for each input tensor; default: required.
-        - indexing (str): shape []; default: "ij".
-    Method:
-        - Wraps `torch.meshgrid` with an explicit `indexing` argument so 1D Swin window coordinates are generated consistently.
-    Output:
-        - return: tuple of coordinate tensors with the same broadcastable spatial shape as the input tensors.
+    Wrapper around torch.meshgrid to avoid warning messages about the introduced `indexing` argument.
+
+    Reference: https://pytorch.org/docs/1.13/generated/torch.meshgrid.html
     """
     return torch.meshgrid(*tensors, indexing=indexing)
 
 def window_partition1D(input_feature: torch.Tensor, window_size: int) -> torch.Tensor:
     """
-    Input:
-        - input_feature (torch.Tensor): shape [B, H, C]; default: required.
-        - window_size (int): shape []; default: required.
-    Method:
-        - Splits the 1D token axis `H` into non-overlapping windows of length `window_size` for local self-attention.
-    Output:
-        - windows (torch.Tensor): shape [B * num_windows, window_size, C].
+    Partitions the given input into windows.
     """
     B, H, W, C = input_feature.shape
     # print(B,H,W,C,window_size)
@@ -45,14 +36,11 @@ def window_partition1D(input_feature: torch.Tensor, window_size: int) -> torch.T
 
 def window_reverse1D(windows, window_size, H):
     """
+    Reverse 1D windows back to shape [B, H, 1, C].
     Input:
-        - windows (torch.Tensor): shape [B * num_windows, window_size, C]; default: required.
-        - window_size (int): shape []; default: required.
-        - H (int): shape []; default: required.
-    Method:
-        - Reassembles partitioned local windows back into the original 1D token order.
+        windows: [B * num_windows, window_size, 1, C]
     Output:
-        - input_feature (torch.Tensor): shape [B, H, C].
+        input_feature: [B, H, 1, C]
     """
     B_times_win, window_h, _, C = windows.shape
     assert window_h == window_size, "window_size mismatch."
@@ -69,28 +57,44 @@ def window_reverse1D(windows, window_size, H):
     return input_feature
 
 
+class RoFormerSinusoidalPositionalEmbedding(nn.Embedding):
+    """Frozen sinusoidal positions used by Hugging Face RoFormer RoPE."""
+
+    def __init__(self, num_positions: int, embedding_dim: int) -> None:
+        super().__init__(num_positions, embedding_dim, _freeze=True)
+        self.weight = nn.Parameter(self.create_weight(), requires_grad=False)
+
+    def create_weight(self):
+        n_pos, dim = self.weight.shape
+        position_enc = np.array(
+            [[pos / np.power(10000, 2 * (j // 2) / dim) for j in range(dim)] for pos in range(n_pos)]
+        )
+        out = torch.empty(n_pos, dim, dtype=self.weight.dtype, requires_grad=False)
+        sentinel = dim // 2 if dim % 2 == 0 else (dim // 2) + 1
+        out[:, 0:sentinel] = torch.FloatTensor(np.sin(position_enc[:, 0::2]))
+        out[:, sentinel:] = torch.FloatTensor(np.cos(position_enc[:, 1::2]))
+        return out
+
+    @torch.no_grad()
+    def forward(self, seq_len: int) -> torch.Tensor:
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=self.weight.device)
+        return super().forward(position_ids)
+
+
 class SwinAttentionBlock(nn.Module):
     """
     Unified Swin attention block.
     If kv_states is None → self-attention
     If kv_states is not None → cross-attention
     """
-    def __init__(self, config, dim, num_heads, window_size):
-        """
-        Input:
-            - config: shape object; default: required.
-            - dim: shape []; default: required.
-            - num_heads: shape []; default: required.
-            - window_size: shape []; default: required.
-        Method:
-            - Executes the `SwinAttentionBlock.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
+    def __init__(self, config, dim, num_heads, window_size, use_rope=False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.all_head_dim = dim
+        self.use_rope = use_rope
+        self.rotary_value = getattr(config, "rotary_value", False)
+        self.use_relative_position_bias = getattr(config, "use_relative_position_bias", True)
 
         self.window_size = (
             window_size if isinstance(window_size, collections.abc.Iterable)
@@ -102,7 +106,8 @@ class SwinAttentionBlock(nn.Module):
             torch.zeros(
                 (2*self.window_size[0]-1) * (2*self.window_size[1]-1),
                 num_heads
-            )
+            ),
+            requires_grad=self.use_relative_position_bias,
         )
 
         coords_h = torch.arange(self.window_size[0])
@@ -118,6 +123,10 @@ class SwinAttentionBlock(nn.Module):
             "relative_position_index",
             relative_coords.sum(-1)
         )
+        self.embed_positions = RoFormerSinusoidalPositionalEmbedding(
+            self.window_size[0] * self.window_size[1],
+            self.head_dim,
+        ) if self.use_rope else None
 
         # --- Q/K/V projections (shared for self and cross) ---
         self.query = nn.Linear(dim, dim, bias=config.qkv_bias)
@@ -125,6 +134,30 @@ class SwinAttentionBlock(nn.Module):
         self.value = nn.Linear(dim, dim, bias=config.qkv_bias)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+
+    @staticmethod
+    def _apply_rotary_position_embedding(sinusoidal_pos, layer):
+        # Hugging Face RoFormer layout:
+        # sin/cos are packed into the last dimension and then repeated pairwise.
+        sin, cos = sinusoidal_pos.chunk(2, dim=-1)
+        sin_pos = torch.stack([sin, sin], dim=-1).reshape_as(sinusoidal_pos)
+        cos_pos = torch.stack([cos, cos], dim=-1).reshape_as(sinusoidal_pos)
+        rotate_half_layer = torch.stack([-layer[..., 1::2], layer[..., ::2]], dim=-1).reshape_as(layer)
+        return layer * cos_pos + rotate_half_layer * sin_pos
+
+    def apply_rotary_position_embeddings(self, query_layer, key_layer, value_layer=None):
+        q_pos = self.embed_positions(query_layer.shape[-2])[None, None, :, :]
+        query_layer = self._apply_rotary_position_embedding(q_pos, query_layer)
+
+        k_pos = self.embed_positions(key_layer.shape[-2])[None, None, :, :]
+        key_layer = self._apply_rotary_position_embedding(k_pos, key_layer)
+
+        if value_layer is not None:
+            v_pos = self.embed_positions(value_layer.shape[-2])[None, None, :, :]
+            value_layer = self._apply_rotary_position_embedding(v_pos, value_layer)
+            return query_layer, key_layer, value_layer
+
+        return query_layer, key_layer
 
     def forward(
         self,
@@ -134,15 +167,8 @@ class SwinAttentionBlock(nn.Module):
         output_attentions=False
     ):
         """
-        Input:
-            - hidden_states: shape [*]; default: required.
-            - kv_states: shape [*]; default: None.
-            - attention_mask: shape [*]; default: None.
-            - output_attentions: shape [*]; default: False.
-        Method:
-            - Executes the `SwinAttentionBlock.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
+        hidden_states : (B, Lq, C)
+        kv_states     : (B, Lkv, C) or None
         """
 
         # ----------------------
@@ -166,6 +192,12 @@ class SwinAttentionBlock(nn.Module):
         k = self.key(kv_states).view(B, Lkv, self.num_heads, self.head_dim).permute(0,2,1,3)
         v = self.value(kv_states).view(B, Lkv, self.num_heads, self.head_dim).permute(0,2,1,3)
 
+        if self.use_rope:
+            if self.rotary_value:
+                q, k, v = self.apply_rotary_position_embeddings(q, k, v)
+            else:
+                q, k = self.apply_rotary_position_embeddings(q, k)
+
         # ----------------------
         # 3. Attention scores
         # ----------------------
@@ -173,14 +205,15 @@ class SwinAttentionBlock(nn.Module):
         attn_scores = attn_scores / math.sqrt(self.head_dim)
 
         # --- relative position bias ---
-        rel_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
-        rel_bias = rel_bias.view(
-            self.window_size[0]*self.window_size[1],
-            self.window_size[0]*self.window_size[1],
-            -1
-        )
-        rel_bias = rel_bias.permute(2,0,1).unsqueeze(0)
-        attn_scores = attn_scores + rel_bias
+        if self.use_relative_position_bias:
+            rel_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
+            rel_bias = rel_bias.view(
+                self.window_size[0]*self.window_size[1],
+                self.window_size[0]*self.window_size[1],
+                -1
+            )
+            rel_bias = rel_bias.permute(2,0,1).unsqueeze(0)
+            attn_scores = attn_scores + rel_bias
 
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
@@ -202,29 +235,11 @@ class SwinAttentionBlock(nn.Module):
     
 class SwinAttentionOutput(nn.Module):
     def __init__(self, config, dim):
-        """
-        Input:
-            - config: shape object; default: required.
-            - dim: shape []; default: required.
-        Method:
-            - Executes the `SwinAttentionOutput.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.dense = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Input:
-            - hidden_states (torch.Tensor): shape [*]; default: required.
-            - input_tensor (torch.Tensor): shape [*]; default: required.
-        Method:
-            - Executes the `SwinAttentionOutput.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
@@ -232,20 +247,9 @@ class SwinAttentionOutput(nn.Module):
 
 
 class SwinAttention(nn.Module):
-    def __init__(self, config, dim, num_heads, window_size):
-        """
-        Input:
-            - config: shape object; default: required.
-            - dim: shape []; default: required.
-            - num_heads: shape []; default: required.
-            - window_size: shape []; default: required.
-        Method:
-            - Executes the `SwinAttention.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
+    def __init__(self, config, dim, num_heads, window_size, use_rope=False):
         super().__init__()
-        self.block = SwinAttentionBlock(config, dim, num_heads, window_size)
+        self.block = SwinAttentionBlock(config, dim, num_heads, window_size, use_rope=use_rope)
         self.output = SwinAttentionOutput(config, dim)
 
     def forward(
@@ -255,17 +259,6 @@ class SwinAttention(nn.Module):
         attention_mask=None,
         output_attentions=False
     ):
-        """
-        Input:
-            - hidden_states: shape [*]; default: required.
-            - kv_states: shape [*]; default: None.
-            - attention_mask: shape [*]; default: None.
-            - output_attentions: shape [*]; default: False.
-        Method:
-            - Executes the `SwinAttention.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         attn_outputs = self.block(
             hidden_states,
             kv_states=kv_states,
@@ -283,14 +276,8 @@ class SwinAttention(nn.Module):
 
 def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
     """
-    Input:
-        - input (torch.Tensor): shape [*]; default: required.
-        - drop_prob (float): shape []; default: 0.0.
-        - training (bool): shape []; default: False.
-    Method:
-        - Executes the `drop_path` logic using the provided inputs and current module state.
-    Output:
-        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+
     """
     if drop_prob == 0.0 or not training:
         return input
@@ -307,35 +294,11 @@ class SwinDropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
 
     def __init__(self, drop_prob: Optional[float] = None) -> None:
-        """
-        Input:
-            - drop_prob (Optional[float]): shape []; default: None.
-        Method:
-            - Executes the `SwinDropPath.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.drop_prob = drop_prob
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Input:
-            - hidden_states (torch.Tensor): shape [*]; default: required.
-        Method:
-            - Executes the `SwinDropPath.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         return drop_path(hidden_states, self.drop_prob, self.training)
 
     def extra_repr(self) -> str:
-        """
-        Input:
-            - No external inputs beyond module state.
-        Method:
-            - Executes the `SwinDropPath.extra_repr` logic using the provided inputs and current module state.
-        Output:
-            - return: value(s) produced by this helper; exact shape follows the implementation below.
-        """
         return f"p={self.drop_prob}"

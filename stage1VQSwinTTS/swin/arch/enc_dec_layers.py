@@ -9,12 +9,7 @@ from functools import partial
 
 def torch_int(x):
     """
-    Input:
-        - x: shape [*]; default: required.
-    Method:
-        - Executes the `torch_int` logic using the provided inputs and current module state.
-    Output:
-        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    Casts an input to a torch int64 tensor if we are in a tracing context, otherwise to a Python int.
     """
 
     return x.to(torch.int64) if torch.jit.is_tracing() and isinstance(x, torch.Tensor) else int(x)
@@ -22,15 +17,6 @@ def torch_int(x):
 
 class SwinIntermediate(nn.Module):
     def __init__(self, config, dim):
-        """
-        Input:
-            - config: shape object; default: required.
-            - dim: shape []; default: required.
-        Method:
-            - Executes the `SwinIntermediate.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.dense = nn.Linear(dim, int(config.mlp_ratio * dim))
         if isinstance(config.hidden_act, str):
@@ -39,14 +25,6 @@ class SwinIntermediate(nn.Module):
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Input:
-            - hidden_states (torch.Tensor): shape [*]; default: required.
-        Method:
-            - Executes the `SwinIntermediate.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
@@ -54,56 +32,30 @@ class SwinIntermediate(nn.Module):
 
 class SwinOutput(nn.Module):
     def __init__(self, config, dim):
-        """
-        Input:
-            - config: shape object; default: required.
-            - dim: shape []; default: required.
-        Method:
-            - Executes the `SwinOutput.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.dense = nn.Linear(int(config.mlp_ratio * dim), dim)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Input:
-            - hidden_states (torch.Tensor): shape [*]; default: required.
-        Method:
-            - Executes the `SwinOutput.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         return hidden_states
 
 class SwinLayer(nn.Module):
     def __init__(self, config, dim, input_resolution, num_heads, drop_path_rate=0.0, shift_size=0, mode=None):
-        """
-        Input:
-            - config: shape object; default: required.
-            - dim: shape []; default: required.
-            - input_resolution: shape [N]; default: required.
-            - num_heads: shape []; default: required.
-            - drop_path_rate: shape [*]; default: 0.0.
-            - shift_size: shape [*]; default: 0.
-            - mode: shape [*]; default: None.
-        Method:
-            - Executes the `SwinLayer.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.shift_size = shift_size
+        self._orig_shift_size = shift_size
         self.window_size = config.window_size
         self.input_resolution = input_resolution
         self.layernorm_before = nn.LayerNorm(dim, eps=config.layer_norm_eps)
         self.mode = mode
-        
-        self.attention = SwinAttention(config, dim, num_heads, window_size=self.window_size)
+        if mode == "decoder":
+            use_rope = getattr(config, "decoder_use_rope", getattr(config, "use_rope", False))
+        else:
+            use_rope = getattr(config, "encoder_use_rope", getattr(config, "use_rope", False))
+
+        self.attention = SwinAttention(config, dim, num_heads, window_size=self.window_size, use_rope=use_rope)
         
 
         self.drop_path = SwinDropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
@@ -112,53 +64,50 @@ class SwinLayer(nn.Module):
         self.output = SwinOutput(config, dim)
 
     def set_shift_and_window_size(self, input_resolution):
-        """
-        Input:
-            - input_resolution: shape [N]; default: required.
-        Method:
-            - Executes the `SwinLayer.set_shift_and_window_size` logic using the provided inputs and current module state.
-        Output:
-            - return: value(s) produced by this helper; exact shape follows the implementation below.
-        """
-        if min(input_resolution) <= self.window_size:
-            
-            # if window size is larger than input resolution, we don't partition windows
+        height, width = input_resolution
+        # Window shifts depend on the sequence length for 1D time series.
+        effective_len = height if width <= 1 else min(height, width)
+        if effective_len <= self.window_size:
+            # A sequence contained in one window uses unshifted attention.
             self.shift_size = torch_int(0)
-            #self.window_size = (torch.min(torch.tensor(input_resolution)) if torch.jit.is_tracing() else min(input_resolution))
+        else:
+            self.shift_size = self._orig_shift_size
 
     def get_attn_mask(self, height, width, dtype, device):
-        """
-        Input:
-            - height: shape []; default: required.
-            - width: shape []; default: required.
-            - dtype: shape [*]; default: required.
-            - device: shape [*]; default: required.
-        Method:
-            - Executes the `SwinLayer.get_attn_mask` logic using the provided inputs and current module state.
-        Output:
-            - return: value(s) produced by this helper; exact shape follows the implementation below.
-        """
         if self.shift_size > 0:
             # calculate attention mask for SW-MSA
             img_mask = torch.zeros((1, height, width, 1), dtype=dtype, device=device)
-            height_slices = (
-                slice(0, -self.window_size),
-                slice(-self.window_size, -self.shift_size),
-                slice(-self.shift_size, None),
-            )
-            width_slices = (
-                slice(0, -self.window_size),
-                slice(-self.window_size, -self.shift_size),
-                slice(-self.shift_size, None),
-            )
-            count = 0
-            for height_slice in height_slices:
-                for width_slice in width_slices:
-                    img_mask[:, height_slice, width_slice, :] = count
-                    count += 1
+            if width <= 1:
+                # 1D SW-MSA: only partition / mask along the sequence (height)
+                height_slices = (
+                    slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None),
+                )
+                for count, height_slice in enumerate(height_slices):
+                    img_mask[:, height_slice, :, :] = count
+                mask_windows = window_partition1D(img_mask, self.window_size)
+                mask_windows = mask_windows.view(-1, self.window_size)
+            else:
+                height_slices = (
+                    slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None),
+                )
+                width_slices = (
+                    slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None),
+                )
+                count = 0
+                for height_slice in height_slices:
+                    for width_slice in width_slices:
+                        img_mask[:, height_slice, width_slice, :] = count
+                        count += 1
 
-            mask_windows = window_partition1D(img_mask, self.window_size)
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+                mask_windows = window_partition1D(img_mask, self.window_size)
+                mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+
             attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
             attn_mask = attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
         else:
@@ -167,16 +116,6 @@ class SwinLayer(nn.Module):
 
     def maybe_pad(self, hidden_states, height, width):
         # 只考虑 height（序列长度）方向的 padding
-        """
-        Input:
-            - hidden_states: shape [*]; default: required.
-            - height: shape []; default: required.
-            - width: shape []; default: required.
-        Method:
-            - Executes the `SwinLayer.maybe_pad` logic using the provided inputs and current module state.
-        Output:
-            - return: value(s) produced by this helper; exact shape follows the implementation below.
-        """
         pad_bottom = (self.window_size - height % self.window_size) % self.window_size
 
         # 不对 width 做 pad：pad_w_left = pad_w_right = 0
@@ -194,18 +133,6 @@ class SwinLayer(nn.Module):
         always_partition: Optional[bool] = False,
         kv_states: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Input:
-            - hidden_states (torch.Tensor): shape [B, T, C]; default: required.
-            - input_dimensions (tuple[int, int]): shape [2]; default: required.
-            - head_mask (torch.FloatTensor | None): shape [num_heads] or None; default: None.
-            - output_attentions (bool): shape []; default: False.
-            - always_partition (bool): shape []; default: False.
-        Method:
-            - Applies shifted-window attention, residual connections, and the feed-forward block for one Swin layer.
-        Output:
-            - return: tuple whose first element is the updated hidden state tensor of shape [B, T, C].
-        """
         if not always_partition:
             self.set_shift_and_window_size(input_dimensions)
         else:
@@ -228,7 +155,10 @@ class SwinLayer(nn.Module):
         _, height_pad, width_pad, _ = hidden_states.shape
         # cyclic shift
         if self.shift_size > 0:
-            shifted_hidden_states = torch.roll(hidden_states, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            if width <= 1:
+                shifted_hidden_states = torch.roll(hidden_states, shifts=-self.shift_size, dims=1)
+            else:
+                shifted_hidden_states = torch.roll(hidden_states, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_hidden_states = hidden_states
 
@@ -241,6 +171,9 @@ class SwinLayer(nn.Module):
         attn_mask = self.get_attn_mask(
             height_pad, width_pad, dtype=hidden_states.dtype, device=hidden_states_windows.device
         )
+        if attn_mask is not None:
+            # (nW, Ws, Ws) -> (B*nW, 1, Ws, Ws) so it broadcasts over heads
+            attn_mask = attn_mask.unsqueeze(1).repeat(batch_size, 1, 1, 1)
         # print('hidden windows.shape: ', hidden_states_windows.shape)
         if self.mode == "encoder":
             attention_outputs = self.attention(hidden_states = hidden_states_windows,
@@ -251,6 +184,11 @@ class SwinLayer(nn.Module):
             # 需要将 kv_states 也切成 window（你已实现 window_partition1D）
             kv = kv_states.view(batch_size, height, width, channels)
             kv, _ = self.maybe_pad(kv, height, width)
+            if self.shift_size > 0:
+                if width <= 1:
+                    kv = torch.roll(kv, shifts=-self.shift_size, dims=1)
+                else:
+                    kv = torch.roll(kv, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
             kv = window_partition1D(kv, self.window_size).view(-1, self.window_size * 1, channels)
 
             attention_outputs = self.attention(hidden_states = hidden_states_windows,
@@ -265,7 +203,10 @@ class SwinLayer(nn.Module):
 
         # reverse cyclic shift
         if self.shift_size > 0:
-            attention_windows = torch.roll(shifted_windows, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            if width <= 1:
+                attention_windows = torch.roll(shifted_windows, shifts=self.shift_size, dims=1)
+            else:
+                attention_windows = torch.roll(shifted_windows, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             attention_windows = shifted_windows
 
@@ -299,16 +240,6 @@ class SwinPatchMerging2D(nn.Module):
     """
 
     def __init__(self, input_resolution: tuple[int], dim: int, norm_layer: nn.Module = nn.LayerNorm) -> None:
-        """
-        Input:
-            - input_resolution (tuple[int]): shape []; default: required.
-            - dim (int): shape []; default: required.
-            - norm_layer (nn.Module): shape [*]; default: nn.LayerNorm.
-        Method:
-            - Executes the `SwinPatchMerging2D.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
@@ -316,16 +247,6 @@ class SwinPatchMerging2D(nn.Module):
         self.norm = norm_layer(4 * dim)
 
     def maybe_pad(self, input_feature, height, width):
-        """
-        Input:
-            - input_feature: shape [*]; default: required.
-            - height: shape []; default: required.
-            - width: shape []; default: required.
-        Method:
-            - Executes the `SwinPatchMerging2D.maybe_pad` logic using the provided inputs and current module state.
-        Output:
-            - return: value(s) produced by this helper; exact shape follows the implementation below.
-        """
         should_pad = (height % 2 == 1) or (width % 2 == 1)
         if should_pad:
             pad_values = (0, 0, 0, width % 2, 0, height % 2)
@@ -334,15 +255,6 @@ class SwinPatchMerging2D(nn.Module):
         return input_feature
 
     def forward(self, input_feature: torch.Tensor, input_dimensions: tuple[int, int]) -> torch.Tensor:
-        """
-        Input:
-            - input_feature (torch.Tensor): shape [*]; default: required.
-            - input_dimensions (tuple[int, int]): shape []; default: required.
-        Method:
-            - Executes the `SwinPatchMerging2D.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         height, width = input_dimensions
         # `dim` is height * width
         batch_size, dim, num_channels = input_feature.shape
@@ -377,16 +289,6 @@ class SwinPatchMerging(nn.Module):
     """
 
     def __init__(self, input_length: int, dim: int, norm_layer=nn.LayerNorm):
-        """
-        Input:
-            - input_length (int): shape []; default: required.
-            - dim (int): shape []; default: required.
-            - norm_layer: shape [*]; default: nn.LayerNorm.
-        Method:
-            - Executes the `SwinPatchMerging.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.input_length = input_length  # H
         self.dim = dim
@@ -394,15 +296,6 @@ class SwinPatchMerging(nn.Module):
         self.norm = norm_layer(2 * dim)
 
     def maybe_pad(self, x, H):
-        """
-        Input:
-            - x: shape [*]; default: required.
-            - H: shape []; default: required.
-        Method:
-            - Executes the `SwinPatchMerging.maybe_pad` logic using the provided inputs and current module state.
-        Output:
-            - return: value(s) produced by this helper; exact shape follows the implementation below.
-        """
         if H % 2 == 1:
             # pad one element on bottom only
             pad = (0, 0, 0, 0, 0, 1)  # pad H dimension (last pair)
@@ -411,13 +304,8 @@ class SwinPatchMerging(nn.Module):
 
     def forward(self, x, input_dimensions):
         """
-        Input:
-            - x: shape [*]; default: required.
-            - input_dimensions: shape [N]; default: required.
-        Method:
-            - Executes the `SwinPatchMerging.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
+        x: [B, H*1, C]  (flattened version)
+        input_dimensions: (H, 1)
         """
         H, W = input_dimensions
         B, HW, C = x.shape
@@ -452,16 +340,6 @@ class SwinPatchExpanding(nn.Module):
     """
 
     def __init__(self, input_length, dim, norm_layer=nn.LayerNorm):
-        """
-        Input:
-            - input_length: shape [*]; default: required.
-            - dim: shape []; default: required.
-            - norm_layer: shape [*]; default: nn.LayerNorm.
-        Method:
-            - Executes the `SwinPatchExpanding.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.input_length = input_length   # L/2
         self.dim = dim
@@ -470,13 +348,8 @@ class SwinPatchExpanding(nn.Module):
 
     def forward(self, x, input_dimensions):
         """
-        Input:
-            - x: shape [*]; default: required.
-            - input_dimensions: shape [N]; default: required.
-        Method:
-            - Executes the `SwinPatchExpanding.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
+        x: [B, L/2, C]
+        return: [B, L, C]
         """
 
         H, W = input_dimensions
@@ -524,15 +397,6 @@ class GradientCheckpointingLayer(nn.Module):
     gradient_checkpointing = False
 
     def __call__(self, *args, **kwargs):
-        """
-        Input:
-            - *args: shape [*]; default: variadic positional input.
-            - **kwargs: shape [*]; default: variadic keyword input.
-        Method:
-            - Executes the `GradientCheckpointingLayer.__call__` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         if self.gradient_checkpointing and self.training:
             do_warn = False
             layer_name = self.__class__.__name__
@@ -570,20 +434,6 @@ class GradientCheckpointingLayer(nn.Module):
 
 class SwinStageEncoder(GradientCheckpointingLayer):
     def __init__(self, config, dim, input_resolution, depth, num_heads, drop_path, downsample):
-        """
-        Input:
-            - config: shape object; default: required.
-            - dim: shape []; default: required.
-            - input_resolution: shape [N]; default: required.
-            - depth: shape [*]; default: required.
-            - num_heads: shape []; default: required.
-            - drop_path: shape [*]; default: required.
-            - downsample: shape [*]; default: required.
-        Method:
-            - Executes the `SwinStageEncoder.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.config = config
         self.dim = dim
@@ -618,17 +468,6 @@ class SwinStageEncoder(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         always_partition: Optional[bool] = False,
     ) -> tuple[torch.Tensor]:
-        """
-        Input:
-            - hidden_states (torch.Tensor): shape [*]; default: required.
-            - input_dimensions (tuple[int, int]): shape []; default: required.
-            - output_attentions (Optional[bool]): shape []; default: False.
-            - always_partition (Optional[bool]): shape []; default: False.
-        Method:
-            - Executes the `SwinStageEncoder.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         height, width = input_dimensions
 
         # print('encoder layer: ', hidden_states.shape)
@@ -660,20 +499,6 @@ class SwinStageDecoder(GradientCheckpointingLayer):
     """
 
     def __init__(self, config, dim, input_resolution, depth, num_heads, drop_path, upsample):
-        """
-        Input:
-            - config: shape object; default: required.
-            - dim: shape []; default: required.
-            - input_resolution: shape [N]; default: required.
-            - depth: shape [*]; default: required.
-            - num_heads: shape []; default: required.
-            - drop_path: shape [*]; default: required.
-            - upsample: shape [*]; default: required.
-        Method:
-            - Executes the `SwinStageDecoder.__init__` logic using the provided inputs and current module state.
-        Output:
-            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
-        """
         super().__init__()
         self.config = config
         self.dim = dim
@@ -712,18 +537,6 @@ class SwinStageDecoder(GradientCheckpointingLayer):
         # print('Decoder Stage Shape: ', hidden_states.shape, kv_states.shape, input_dimensions)
 
 
-        """
-        Input:
-            - hidden_states (torch.Tensor): shape [*]; default: required.
-            - kv_states (torch.Tensor): shape [*]; default: required.
-            - input_dimensions (tuple[int, int]): shape []; default: required.
-            - output_attentions (bool): shape []; default: False.
-            - always_partition (bool): shape []; default: False.
-        Method:
-            - Executes the `SwinStageDecoder.forward` logic using the provided inputs and current module state.
-        Output:
-            - return: tensor(s) or structured outputs produced by this module; exact layout follows the implementation below.
-        """
         height, width = input_dimensions
 
         for block in self.blocks:
@@ -752,5 +565,4 @@ class SwinStageDecoder(GradientCheckpointingLayer):
         if output_attentions:
             stage_outputs += layer_outputs[1:]
         return stage_outputs
-
 
